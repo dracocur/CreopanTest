@@ -2,9 +2,13 @@
 
 namespace App\Models;
 
+use Config;
+use App\Models\Model;
+
 use App\Traits\Commentable;
 
-class SitePage extends Model {
+class SitePage extends Model
+{
     use Commentable;
 
     /**
@@ -13,7 +17,7 @@ class SitePage extends Model {
      * @var array
      */
     protected $fillable = [
-        'key', 'title', 'text', 'parsed_text', 'is_visible', 'can_comment', 'allow_dislikes',
+        'key', 'title', 'text', 'parsed_text', 'is_visible', 'admin_only', 'can_comment'
     ];
 
     /**
@@ -36,9 +40,10 @@ class SitePage extends Model {
      * @var array
      */
     public static $createRules = [
-        'key'   => 'required|unique:site_pages|between:3,25|alpha_dash',
+        'key' => 'required|unique:site_pages|between:3,25|alpha_dash',
         'title' => 'required|between:3,100',
-        'text'  => 'nullable',
+        'text' => 'nullable',
+        'admin_only' => 'boolean'
     ];
 
     /**
@@ -47,9 +52,10 @@ class SitePage extends Model {
      * @var array
      */
     public static $updateRules = [
-        'key'   => 'required|between:3,25|alpha_dash',
+        'key' => 'required|between:3,25|alpha_dash',
         'title' => 'required|between:3,100',
-        'text'  => 'nullable',
+        'text' => 'nullable',
+        'admin_only' => 'boolean'
     ];
 
     /**
@@ -57,7 +63,8 @@ class SitePage extends Model {
      *
      * @return string
      */
-    public function getUrlAttribute() {
+    public function getUrlAttribute()
+    {
         return url('info/'.$this->key);
     }
 
@@ -66,25 +73,8 @@ class SitePage extends Model {
      *
      * @return string
      */
-    public function getDisplayNameAttribute() {
+    public function getDisplayNameAttribute()
+    {
         return '<a href="'.$this->url.'">'.$this->title.'</a>';
-    }
-
-    /**
-     * Gets the admin edit URL.
-     *
-     * @return string
-     */
-    public function getAdminUrlAttribute() {
-        return url('admin/pages/edit/'.$this->id);
-    }
-
-    /**
-     * Gets the power required to edit this model.
-     *
-     * @return string
-     */
-    public function getAdminPowerAttribute() {
-        return 'edit_pages';
     }
 }
