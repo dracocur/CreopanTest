@@ -14,6 +14,7 @@ use File;
 use App\Services\CurrencyManager;
 use App\Services\InventoryManager;
 
+use Illuminate\Support\Arr;
 use App\Models\User\User;
 use App\Models\User\UserItem;
 use App\Models\Character\Character;
@@ -24,13 +25,20 @@ use App\Models\Character\CharacterImage;
 use App\Models\Character\CharacterTransfer;
 use App\Models\Character\CharacterDesignUpdate;
 use App\Models\Character\CharacterBookmark;
-use App\Models\Character\CharacterLineage;
+use App\Models\Character\CharacterBreedingLog;
+use App\Models\Character\CharacterBreedingLogRelation;
+use App\Models\Character\CharacterGenome;
+use App\Models\Character\CharacterGenomeGene;
+use App\Models\Character\CharacterGenomeGradient;
+use App\Models\Character\CharacterGenomeNumeric;
 use App\Models\User\UserCharacterLog;
 use App\Models\Species\Species;
 use App\Models\Species\Subtype;
 use App\Models\Rarity;
 use App\Models\Currency\Currency;
 use App\Models\Feature\Feature;
+use App\Models\Genetics\Loci;
+use App\Models\Genetics\LociAllele;
 
 class CharacterManager extends Service
 {
@@ -76,6 +84,162 @@ class CharacterManager extends Service
     }
 
     /**
+     * Creates a new litter of MYOs.
+     *
+     * @param  array                  $data
+     * @param  \App\Models\User\User  $user
+     * @param  bool                   $isMyo
+     * @return \App\Models\Character\Character|bool
+     */
+    public function createMyoLitter($data, $user)
+    {
+        DB::beginTransaction();
+        try {
+            // Validate the parents.
+            if(!(isset($data['parents'])) || count($data['parents']) < 2) throw new \Exception("There needs to be 2 parents selected.");
+            if(count($data['parents']) > 2) throw new \Exception("Breedings of 3 or more parents are not supported.");
+
+            $parents = [];
+            foreach ($data['parents'] as $index => $id) {
+                $parents[$index] = Character::where('id', $id)->first();
+                if (!$parents[$index]) throw new \Exception("Couldn't find parent #". $index .".");
+                if (!$parents[$index]->genomes) throw new \Exception("Parent #". $index ." doesn't have a genome.");
+            }
+
+            // Get roller settings.
+            $settings = [
+                'min_offspring'  => isset($data['min_offspring'])  ? max(0, $data['min_offspring']) : 0,
+                'max_offspring'  => isset($data['max_offspring'])  ? max(1, $data['max_offspring']) : 1,
+                'twin_chance'    => isset($data['twin_chance'])    ? max(0, min(100, $data['twin_chance'])) : 0,
+                'twin_depth'     => isset($data['twin_depth'])     ? max(0, $data['twin_depth']) : 1,
+                'chimera_chance' => isset($data['chimera_chance']) ? max(0, min(100, $data['chimera_chance'])) : 0,
+                'max_genomes'    => isset($data['chimera_depth'])  ? max(1, $data['chimera_depth']) : 1,
+                'litter_limit'   => isset($data['litter_limit'])   ? max(1, $data['litter_limit']) : 1,
+            ];
+
+            // Create the Breeding Log.
+            $litterLog = CharacterBreedingLog::create([
+                'name' => isset($data['name']) ? $data['name'] : null,
+                'roller_settings' => $settings,
+                'rolled_at' => Carbon::now(),
+                'user_id' => $user->id,
+            ]);
+
+            // Log the parents.
+            foreach ($parents as $parent) {
+                $log = CharacterBreedingLogRelation::create([
+                    'log_id' => $litterLog->id,
+                    'character_id' => $parent->id,
+                    'is_parent' => true,
+                ]);
+                if (!$log) throw new \Exception("Couldn't generate parent log.");
+            }
+
+            // Generate the children...
+            // *******************************************************
+
+            $bool = isset($data['default_image']);
+            $data += ['default_image' => true, 'feature_id' => [], 'feature_data' => []];
+            if( isset($data['generate_lineage']) && $data['generate_lineage'] && method_exists($this, 'handleCharacterLineage')) {
+                $data += [
+                    // Character Lineages
+                    'generate_ancestors' => true,
+                    'sire_id' => $parents[1]->id,
+                    'dam_id' => $parents[0]->id,
+
+                    // WB Lineages
+                    'parent_type' => ["Character", "Character"],
+                    'parent_data' => [$parents[0]->id, $parents[1]->id],
+                ];
+            }
+            $litter = [];
+            $genomes = [];
+            for ($i = 0; $i < mt_rand($settings['min_offspring'], $settings['max_offspring']); $i++) {
+                // a function inside CharacterGenome that will cross mother's genes with father's.
+                // called from the mother's genome to ensure the matrilineal genes go first.
+                // random() allows for children of chimera to inherit from different genomes.
+                // the method returns the format of genome data used by handleCharacterGenome().
+                $genomes = [ $parents[0]->genomes->random()->breedWith($parents[1]->genomes->random()) ];
+                $child = $this->createCharacter(
+                    ['name' => $data['name']." #".(count($litter)+1)] + $data + $genomes[0], $user, true,
+                );
+                if (!$child) throw new \Exception("Failed to generate child!");
+                while (mt_rand(1, 100) <= $settings['chimera_chance'] && count($genomes) < $settings['max_genomes']) {
+                    $genome = $parents[0]->genomes->random()->breedWith($parents[1]->genomes->random());
+                    $geno = $this->handleCharacterGenome($genome, $child);
+                    if (!$geno) throw new \Exception("Chimerism roll failed to create genome.");
+                    array_push($genomes, $genome);
+                }
+
+                // Creation finished, add them to the breeding log.
+                $log = CharacterBreedingLogRelation::create([
+                    'log_id' => $litterLog->id,
+                    'character_id' => $child->id,
+                    'is_parent' => false,
+                    'twin_id' => null,
+                    'chimerism' => count($genomes) > 1,
+                ]);
+                if (!$log) throw new \Exception("Failed to generate child log.");
+
+                // The litter size is increasing.
+                array_push($litter, $child);
+                if (count($litter) >= $settings['litter_limit']) break;
+
+                // *******************************************************
+
+                $d = 0; // Current twin depth is zero, as we do not have any twins.
+                $source = $child->id; // the character id of the current twin's source.
+                while (mt_rand(1, 100) <= $settings['twin_chance'] && $d < $settings['twin_depth'] && count($litter) < $settings['litter_limit']) {
+                    // Grab this twin's genome from the genomes pool, then reset the pool.
+                    $genomes = [ $genomes[mt_rand(0, count($genomes)-1)] ];
+                    $child = $this->createCharacter(
+                        ['name' => $data['name']." #".(count($litter)+1)] + $data + $genomes[0], $user, true,
+                    );
+                    if (!$child) throw new \Exception("Failed to generate twin!");
+                    while (mt_rand(1, 100) <= $settings['chimera_chance'] && count($genomes) < $settings['max_genomes']) {
+                        $genome = $parents[0]->genomes->random()->breedWith($parents[1]->genomes->random());
+                        $geno = $this->handleCharacterGenome($genome, $child);
+                        if (!$geno) throw new \Exception("Twin chimerism roll failed to create genome.");
+                        array_push($genomes, $genome);
+                    }
+
+                    // Creation finished, add them to the breeding log.
+                    $log = CharacterBreedingLogRelation::create([
+                        'log_id' => $litterLog->id,
+                        'character_id' => $child->id,
+                        'is_parent' => false,
+                        'twin_id' => $source,
+                        'chimerism' => count($genomes) > 1,
+                    ]);
+                    if (!$log) throw new \Exception("Failed to generate child log.");
+
+                    // The litter size is increasing.
+                    array_push($litter, $child);
+                    if (count($litter) >= $settings['litter_limit']) break(2);
+
+                    // This child becomes the new source, and the twin depth has increased.
+                    $source = $child->id;
+                    $d++;
+                }
+            }
+
+            // *******************************************************
+            // The children have generated...
+
+            // Clean up the images we told the character manager not to delete.
+            if (!$bool) {
+                $this->deleteImage($litter[0]->image->imageDirectory, $litter[0]->image->imageFileName);
+                $this->deleteImage($litter[0]->image->imageDirectory, $litter[0]->image->thumbnailFileName);
+            }
+
+            return $this->commitReturn($litterLog);
+        } catch(\Exception $e) {
+            $this->setError('error', $e->getMessage());
+        }
+        return $this->rollbackReturn(false);
+    }
+
+    /**
      * Creates a new character or MYO slot.
      *
      * @param  array                  $data
@@ -90,7 +254,7 @@ class CharacterManager extends Service
         try {
             if(!$isMyo && Character::where('slug', $data['slug'])->exists()) throw new \Exception("Please enter a unique character code.");
 
-            if(!(isset($data['user_id']) && $data['user_id']) && !(isset($data['owner_alias']) && $data['owner_alias']))
+            if(!(isset($data['user_id']) && $data['user_id']) && !(isset($data['owner_url']) && $data['owner_url']))
                 throw new \Exception("Please select an owner.");
             if(!$isMyo)
             {
@@ -106,26 +270,22 @@ class CharacterManager extends Service
             else $data['subtype_id'] = null;
 
             // Get owner info
-            $recipient = null;
+            $url = null;
             $recipientId = null;
-            $alias = null;
             if(isset($data['user_id']) && $data['user_id']) $recipient = User::find($data['user_id']);
-            elseif(isset($data['owner_alias']) && $data['owner_alias']) $recipient = User::where('alias', $data['owner_alias'])->first();
+            elseif(isset($data['owner_url']) && $data['owner_url']) $recipient = checkAlias($data['owner_url']);
 
-            if($recipient) {
+            if(is_object($recipient)) {
                 $recipientId = $recipient->id;
                 $data['user_id'] = $recipient->id;
             }
             else {
-                $alias = $data['owner_alias'];
+                $url = $recipient;
             }
 
             // Create character
             $character = $this->handleCharacter($data, $isMyo);
             if(!$character) throw new \Exception("Error happened while trying to create character.");
-
-            // Create character lineage
-            $lineage = $this->handleCharacterLineage($data, $character, $isMyo);
 
             // Create character image
             $data['is_valid'] = true; // New image of new characters are always valid
@@ -136,25 +296,31 @@ class CharacterManager extends Service
             $character->character_image_id = $image->id;
             $character->save();
 
+            // Can't and shouldn't always create a character with a genome.
+            // Try create character genome if there's data for it.
+            if (isset($data['gene_id'])) {
+                $genome = $this->handleCharacterGenome($data, $character);
+                if(!$genome) throw new \Exception("Error happened while trying to create genome.");
+            }
+
             // Add a log for the character
             // This logs all the updates made to the character
-            $this->createLog($user->id, null, $recipientId, $alias, $character->id, $isMyo ? 'MYO Slot Created' : 'Character Created', 'Initial upload', 'character');
+            $this->createLog($user->id, null, $recipientId, $url, $character->id, $isMyo ? 'MYO Slot Created' : 'Character Created', 'Initial upload', 'character');
 
             // Add a log for the user
             // This logs ownership of the character
-            $this->createLog($user->id, null, $recipientId, $alias, $character->id, $isMyo ? 'MYO Slot Created' : 'Character Created', 'Initial upload', 'user');
+            $this->createLog($user->id, null, $recipientId, $url, $character->id, $isMyo ? 'MYO Slot Created' : 'Character Created', 'Initial upload', 'user');
 
             // Update the user's FTO status and character count
-            if($recipient) {
+            if(is_object($recipient)) {
                 if(!$isMyo) {
                     $recipient->settings->is_fto = 0; // MYO slots don't affect the FTO status - YMMV
                 }
                 $recipient->settings->save();
             }
 
-
             // If the recipient has an account, send them a notification
-            if($recipient && $user->id != $recipient->id) {
+            if(is_object($recipient) && $user->id != $recipient->id) {
                 Notifications::create($isMyo ? 'MYO_GRANT' : 'CHARACTER_UPLOAD', $recipient, [
                     'character_url' => $character->url,
                 ] + ($isMyo ?
@@ -190,14 +356,14 @@ class CharacterManager extends Service
                 $data['rarity_id'] = isset($data['rarity_id']) && $data['rarity_id'] ? $data['rarity_id'] : null;
             }
 
-            $characterData = array_only($data, [
+            $characterData = Arr::only($data, [
                 'character_category_id', 'rarity_id', 'user_id',
                 'number', 'slug', 'description',
                 'sale_value', 'transferrable_at', 'is_visible'
             ]);
 
             $characterData['name'] = ($isMyo && isset($data['name'])) ? $data['name'] : null;
-            $characterData['owner_alias'] = isset($characterData['user_id']) ? null : $data['owner_alias'];
+            $characterData['owner_url'] = isset($characterData['user_id']) ? null : $data['owner_url'];
             $characterData['is_sellable'] = isset($data['is_sellable']);
             $characterData['is_tradeable'] = isset($data['is_tradeable']);
             $characterData['is_giftable'] = isset($data['is_giftable']);
@@ -219,6 +385,103 @@ class CharacterManager extends Service
             $this->setError('error', $e->getMessage());
         }
         return false;
+    }
+
+    /**
+     * Handles character genome data.
+     *
+     * @param  array                                  $data
+     * @param  \App\Models\Character\Character        $character
+     * @param  \App\Models\Character\CharacterGenome  $character
+     * @return \App\Models\Character\CharacterGenome|bool
+     */
+    private function handleCharacterGenome($data, $character, $genome = null)
+    {
+        try {
+            if(!$genome) {
+                $genome = CharacterGenome::create(['character_id' => $character->id]);
+            } else {
+                $genome->genes()->delete();
+                $genome->gradients()->delete();
+                $genome->numerics()->delete();
+            }
+
+            $alleleOffset = 0;
+            $gradientOffset = 0;
+            $numOffset = 0;
+
+            foreach($data['gene_id'] as $index => $id)
+            {
+                $loci = Loci::where('id', $id)->first();
+                if($loci && $loci->type == "gene") {
+                    for ($i=0; $i < $loci->length; $i++) {
+                        $key = $alleleOffset;
+                        $allele = isset($data['gene_allele_id'][$key]) ? $data['gene_allele_id'][$key] : null;
+                        if($allele != null) CharacterGenomeGene::create([
+                            'character_genome_id' => $genome->id,
+                            'loci_allele_id' => $allele,
+                            'loci_id' => $loci->id,
+                        ]);
+                        $alleleOffset++;
+                    }
+                } elseif ($loci && $loci->type == "gradient") {
+                    $key = $gradientOffset;
+                    $value = isset($data['gene_gradient_data'][$key]) ? $data['gene_gradient_data'][$key] : null;
+                    $value = preg_replace(["/\+/", "/-/"], ["1", "0"], $value);
+                    while (strlen($value) < $loci->length) $value .= "0";
+                    if($value != null) CharacterGenomeGradient::create([
+                        'character_genome_id' => $genome->id,
+                        'loci_id' => $loci->id,
+                        'value' => $value,
+                    ]);
+                    $gradientOffset++;
+                } elseif ($loci && $loci->type == "numeric") {
+                    $key = $numOffset;
+                    $value = isset($data['gene_numeric_data'][$key]) ? $data['gene_numeric_data'][$key] : null;
+                    $value = max(min(255, $value), 0);
+                    if($value != null) CharacterGenomeNumeric::create([
+                        'character_genome_id' => $genome->id,
+                        'loci_id' => $loci->id,
+                        'value' => $value,
+                    ]);
+                    $numOffset++;
+                }
+            }
+
+            if (isset($data['genome_visibility'])) {
+                $genome->visibility_level = min(2, max(0, $data['genome_visibility']));
+                $genome->save();
+            }
+            return $genome;
+        } catch(\Exception $e) {
+            $this->setError('error', $e->getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Deletes a character genome.
+     *
+     * @param \App\Models\Character\Character  $character
+     * @param \App\Models\Character\Genome     $character
+     * @return bool
+     */
+    public function deleteCharacterGenome($character, $genome)
+    {
+        DB::beginTransaction();
+        try {
+            if ($genome->character->id != $character->id) throw new \Exception("Wrong character.");
+
+            $genome->genes()->delete();
+            $genome->gradients()->delete();
+            $genome->numerics()->delete();
+            $genome->delete();
+
+            return $this->commitReturn(true);
+        } catch(\Exception $e) {
+            $this->setError('error', $e->getMessage());
+        }
+        return $this->rollbackReturn(false);
     }
 
     /**
@@ -249,7 +512,7 @@ class CharacterManager extends Service
                     unset($data['use_cropper']);
                 }
             }
-            $imageData = array_only($data, [
+            $imageData = Arr::only($data, [
                 'species_id', 'subtype_id', 'rarity_id', 'use_cropper',
                 'x0', 'x1', 'y0', 'y1',
             ]);
@@ -266,14 +529,30 @@ class CharacterManager extends Service
 
             $image = CharacterImage::create($imageData);
 
+            // Check if entered url(s) have aliases associated with any on-site users
+            foreach($data['designer_url'] as $key=>$url) {
+                $recipient = checkAlias($url, false);
+                if(is_object($recipient)) {
+                    $data['designer_id'][$key] = $recipient->id;
+                    $data['designer_url'][$key] = null;
+                }
+            }
+            foreach($data['artist_url'] as $key=>$url) {
+                $recipient = checkAlias($url, false);
+                if(is_object($recipient)) {
+                    $data['artist_id'][$key] = $recipient->id;
+                    $data['artist_url'][$key] = null;
+                }
+            }
+
             // Check that users with the specified id(s) exist on site
-            foreach($data['designer_alias'] as $id) {
+            foreach($data['designer_id'] as $id) {
                 if(isset($id) && $id) {
                     $user = User::find($id);
                     if(!$user) throw new \Exception('One or more designers is invalid.');
                 }
             }
-            foreach($data['artist_alias'] as $id) {
+            foreach($data['artist_id'] as $id) {
                 if(isset($id) && $id) {
                     $user = $user = User::find($id);
                     if(!$user) throw new \Exception('One or more artists is invalid.');
@@ -281,7 +560,7 @@ class CharacterManager extends Service
             }
 
             // Attach artists/designers
-            foreach($data['designer_alias'] as $key => $id) {
+            foreach($data['designer_id'] as $key => $id) {
                 if($id || $data['designer_url'][$key])
                     DB::table('character_image_creators')->insert([
                         'character_image_id' => $image->id,
@@ -290,7 +569,7 @@ class CharacterManager extends Service
                         'user_id' => $id
                     ]);
             }
-            foreach($data['artist_alias'] as $key => $id) {
+            foreach($data['artist_id'] as $key => $id) {
                 if($id || $data['artist_url'][$key])
                     DB::table('character_image_creators')->insert([
                         'character_image_id' => $image->id,
@@ -304,7 +583,7 @@ class CharacterManager extends Service
             $this->handleImage($data['image'], $image->imageDirectory, $image->imageFileName, null, isset($data['default_image']));
 
             // Save thumbnail first before processing full image
-            if(isset($data['use_cropper'])) $this->cropThumbnail(array_only($data, ['x0','x1','y0','y1']), $image, $isMyo);
+            if(isset($data['use_cropper'])) $this->cropThumbnail(Arr::only($data, ['x0','x1','y0','y1']), $image, $isMyo);
             else $this->handleImage($data['thumbnail'], $image->imageDirectory, $image->thumbnailFileName, null, isset($data['default_image']));
 
             // Process and save the image itself
@@ -326,138 +605,6 @@ class CharacterManager extends Service
     }
 
     /**
-     * Handles character lineage data.
-     *
-     * @param  array                            $data
-     * @return \App\Models\Character\Character  $character
-     * @param  bool                             $isMyo
-     * @return \App\Models\Character\CharacterLineage|bool
-     */
-    private function handleCharacterLineage($data, $character, $isMyo = false)
-    {
-        try {
-            // TODO take values from $data
-            $lineageData = [
-                'character_id'          => $character->id,
-                'sire_id'               => null,
-                'sire_name'             => null,
-                'sire_sire_id'          => null,
-                'sire_sire_name'        => null,
-                'sire_sire_sire_id'     => null,
-                'sire_sire_sire_name'   => null,
-                'sire_sire_dam_id'      => null,
-                'sire_sire_dam_name'    => null,
-                'sire_dam_id'           => null,
-                'sire_dam_name'         => null,
-                'sire_dam_sire_id'      => null,
-                'sire_dam_sire_name'    => null,
-                'sire_dam_dam_id'       => null,
-                'sire_dam_dam_name'     => null,
-                'dam_id'                => null,
-                'dam_name'              => null,
-                'dam_sire_id'           => null,
-                'dam_sire_name'         => null,
-                'dam_sire_sire_id'      => null,
-                'dam_sire_sire_name'    => null,
-                'dam_sire_dam_id'       => null,
-                'dam_sire_dam_name'     => null,
-                'dam_dam_id'            => null,
-                'dam_dam_name'          => null,
-                'dam_dam_sire_id'       => null,
-                'dam_dam_sire_name'     => null,
-                'dam_dam_dam_id'        => null,
-                'dam_dam_dam_name'      => null,
-            ];
-            $roots = [
-                'sire',
-                'sire_sire',
-                'sire_sire_sire',
-                'sire_sire_dam',
-                'sire_dam',
-                'sire_dam_sire',
-                'sire_dam_dam',
-                'dam',
-                'dam_sire',
-                'dam_sire_sire',
-                'dam_sire_dam',
-                'dam_dam',
-                'dam_dam_sire',
-                'dam_dam_dam'
-            ];
-            // you don't need to look for great-great-grandparents
-            $shortlist = [
-                'sire',
-                'sire_sire',
-                'sire_dam',
-                'dam',
-                'dam_sire',
-                'dam_dam',
-            ];
-
-            // check if lineage is empty ...
-            $isEmpty = true;
-
-            // Checking inputs ?
-            for ($i=0; $i < 14; $i++) {
-                // if isset Data key_id, set Lineage key_id and check if that character exists?
-                // else if isset Data key_name, set Lineage key_name to that.
-                if (isset($data[$roots[$i].'_id'])) {
-                    $id = $data[$roots[$i].'_id'];
-                    $lineageData[$roots[$i].'_id'] = $id;
-                    $char = Character::find($id);
-
-                    // TODO Set name to be the slug of the character.
-                    $lineageData[$roots[$i].'_name'] = $char->slug;
-                    $isEmpty = false;
-                }
-                else if (isset($data[$roots[$i].'_name'])) {
-                    $lineageData[$roots[$i].'_name'] = $data[$roots[$i].'_name'];
-                    $isEmpty = $data[$roots[$i].'_name'] == "" ? $isEmpty : false;
-                }
-            }
-
-            //TODO: Fill from ancestor(s) IF ancestor fill is checked.
-            if (isset($data['generate_ancestors']) && !$isEmpty)
-            {
-                for ($j=0; $j < 6; $j++) {
-                    $key = $shortlist[$j];
-                    $id = $data[$key.'_id'];
-
-                    // check if this is a character id and not null
-                    if ($id !== null)
-                    {
-                        // check if this exists and has lineage
-                        $char = Character::find($id);
-                        if($char->exists() && $char->lineage !== null)
-                        {
-                            // go through their parents and gparents
-                            for ($k=0; $k < 6; $k++)
-                            {
-                                // checks that this is a valid lineage index
-                                // eg. sire_sire_sire and not sire_sire_sire_sire
-                                $key2 = $key."_".$shortlist[$k];
-                                if (in_array($key2, $roots, true))
-                                {
-                                    $lineageData[$key2."_id"] = $char->lineage[$shortlist[$k]."_id"];
-                                    $lineageData[$key2."_name"] = $char->lineage[$shortlist[$k]."_name"];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // throw new \Exception('Everything went right, we hope.');
-
-            $lineage = $isEmpty ? null : CharacterLineage::create($lineageData);
-            return $lineage;
-        } catch(\Exception $e) {
-            $this->setError('error', $e->getMessage());
-        }
-        return false;
-
-    }
-
-    /**
      * Trims and optionally resizes and watermarks an image.
      *
      *
@@ -467,6 +614,24 @@ class CharacterManager extends Service
     {
         // Trim transparent parts of image.
         $image = Image::make($characterImage->imagePath . '/' . $characterImage->imageFileName)->trim('transparent');
+
+        if (Config::get('lorekeeper.settings.masterlist_image_automation') == 1)
+        {
+            // Make the image be square
+            $imageWidth = $image->width();
+            $imageHeight = $image->height();
+
+            if( $imageWidth > $imageHeight) {
+                // Landscape
+                $canvas = Image::canvas($image->width(), $image->width());
+                $image = $canvas->insert($image, 'center');
+            }
+            else {
+                // Portrait
+                $canvas = Image::canvas($image->height(), $image->height());
+                $image = $canvas->insert($image, 'center');
+            }
+        }
 
         if(Config::get('lorekeeper.settings.masterlist_image_format') != 'png' && Config::get('lorekeeper.settings.masterlist_image_format') != null && Config::get('lorekeeper.settings.masterlist_image_background') != null) {
             $canvas = Image::canvas($image->width(), $image->height(), Config::get('lorekeeper.settings.masterlist_image_background'));
@@ -559,6 +724,24 @@ class CharacterManager extends Service
             // Trim transparent parts of image.
             $image->trim(isset($trimColor) && $trimColor ? 'top-left' : 'transparent');
 
+            if (Config::get('lorekeeper.settings.masterlist_image_automation') == 1)
+            {
+                // Make the image be square
+                $imageWidth = $image->width();
+                $imageHeight = $image->height();
+
+                if( $imageWidth > $imageHeight) {
+                    // Landscape
+                    $canvas = Image::canvas($image->width(), $image->width());
+                    $image = $canvas->insert($image, 'center');
+                }
+                else {
+                    // Portrait
+                    $canvas = Image::canvas($image->height(), $image->height());
+                    $image = $canvas->insert($image, 'center');
+                }
+            }
+
             $cropWidth = Config::get('lorekeeper.settings.masterlist_thumbnails.width');
             $cropHeight = Config::get('lorekeeper.settings.masterlist_thumbnails.height');
 
@@ -613,22 +796,28 @@ class CharacterManager extends Service
                     });
                 }
             }
-            $xOffset = 0 + (($points['x0'] - $trimOffsetX) > 0 ? ($points['x0'] - $trimOffsetX) : 0);
-            if(($xOffset + $cropWidth) > $image->width()) $xOffsetNew = $cropWidth - ($image->width() - $xOffset);
-            if(isset($xOffsetNew)) if(($xOffsetNew + $cropWidth) > $image->width()) $xOffsetNew = $image->width() - $cropWidth;
-            $yOffset = 0 + (($points['y0'] - $trimOffsetY) > 0 ? ($points['y0'] - $trimOffsetY) : 0);
-            if(($yOffset + $cropHeight) > $image->height()) $yOffsetNew = $cropHeight - ($image->height() - $yOffset);
-            if(isset($yOffsetNew)) if(($yOffsetNew + $cropHeight) > $image->height()) $yOffsetNew = $image->height() - $cropHeight;
+            if (Config::get('lorekeeper.settings.masterlist_image_automation') == 0)
+            {
+                $xOffset = 0 + (($points['x0'] - $trimOffsetX) > 0 ? ($points['x0'] - $trimOffsetX) : 0);
+                if(($xOffset + $cropWidth) > $image->width()) $xOffsetNew = $cropWidth - ($image->width() - $xOffset);
+                if(isset($xOffsetNew)) if(($xOffsetNew + $cropWidth) > $image->width()) $xOffsetNew = $image->width() - $cropWidth;
+                $yOffset = 0 + (($points['y0'] - $trimOffsetY) > 0 ? ($points['y0'] - $trimOffsetY) : 0);
+                if(($yOffset + $cropHeight) > $image->height()) $yOffsetNew = $cropHeight - ($image->height() - $yOffset);
+                if(isset($yOffsetNew)) if(($yOffsetNew + $cropHeight) > $image->height()) $yOffsetNew = $image->height() - $cropHeight;
 
-            // Crop according to the selected area
-            $image->crop($cropWidth, $cropHeight, isset($xOffsetNew) ? $xOffsetNew : $xOffset, isset($yOffsetNew) ? $yOffsetNew : $yOffset);
+                // Crop according to the selected area
+                $image->crop($cropWidth, $cropHeight, isset($xOffsetNew) ? $xOffsetNew : $xOffset, isset($yOffsetNew) ? $yOffsetNew : $yOffset);
+            }
         }
         else {
             $cropWidth = $points['x1'] - $points['x0'];
             $cropHeight = $points['y1'] - $points['y0'];
 
-            // Crop according to the selected area
-            $image->crop($cropWidth, $cropHeight, $points['x0'], $points['y0']);
+            if (Config::get('lorekeeper.settings.masterlist_image_automation') == 0)
+            {
+                // Crop according to the selected area
+                $image->crop($cropWidth, $cropHeight, $points['x0'], $points['y0']);
+            }
 
             // Resize to fit the thumbnail size
             $image->resize(Config::get('lorekeeper.settings.masterlist_thumbnails.width'), Config::get('lorekeeper.settings.masterlist_thumbnails.height'));
@@ -642,8 +831,9 @@ class CharacterManager extends Service
      * Creates a character log.
      *
      * @param  int     $senderId
+     * @param  string  $senderUrl
      * @param  int     $recipientId
-     * @param  string  $recipientAlias
+     * @param  string  $recipientUrl
      * @param  int     $characterId
      * @param  string  $type
      * @param  string  $data
@@ -653,14 +843,14 @@ class CharacterManager extends Service
      * @param  string  $newData
      * @return bool
      */
-    public function createLog($senderId, $senderAlias, $recipientId, $recipientAlias, $characterId, $type, $data, $logType, $isUpdate = false, $oldData = null, $newData = null)
+    public function createLog($senderId, $senderUrl, $recipientId, $recipientUrl, $characterId, $type, $data, $logType, $isUpdate = false, $oldData = null, $newData = null)
     {
         return DB::table($logType == 'character' ? 'character_log' : 'user_character_log')->insert(
             [
                 'sender_id' => $senderId,
-                'sender_alias' => $senderAlias,
+                'sender_url' => $senderUrl,
                 'recipient_id' => $recipientId,
-                'recipient_alias' => $recipientAlias,
+                'recipient_url' => $recipientUrl,
                 'character_id' => $characterId,
                 'log' => $type . ($data ? ' (' . $data . ')' : ''),
                 'log_type' => $type,
@@ -715,15 +905,15 @@ class CharacterManager extends Service
 
             // Add a log for the character
             // This logs all the updates made to the character
-            $this->createLog($user->id, null, $character->user_id, $character->user_id ? $character->user->alias : $character->owner_alias, $character->id, 'Character Image Uploaded', '[#'.$image->id.']', 'character');
+            $this->createLog($user->id, null, $character->user_id, ($character->user_id ? null : $character->owner_url), $character->id, 'Character Image Uploaded', '[#'.$image->id.']', 'character');
 
             // If the recipient has an account, send them a notification
             if($character->user && $user->id != $character->user_id && $character->is_visible) {
                 Notifications::create('IMAGE_UPLOAD', $character->user, [
                     'character_url' => $character->url,
                     'character_slug' => $character->slug,
-					'character_name' => $character->name,
-					'sender_url' => $user->url,
+                    'character_name' => $character->name,
+                    'sender_url' => $user->url,
                     'sender_name' => $user->name
                 ]);
             }
@@ -866,14 +1056,30 @@ class CharacterManager extends Service
             // Clear old artists/designers
             $image->creators()->delete();
 
+            // Check if entered url(s) have aliases associated with any on-site users
+            foreach($data['designer_url'] as $key=>$url) {
+                $recipient = checkAlias($url, false);
+                if(is_object($recipient)) {
+                    $data['designer_id'][$key] = $recipient->id;
+                    $data['designer_url'][$key] = null;
+                }
+            }
+            foreach($data['artist_url'] as $key=>$url) {
+                $recipient = checkAlias($url, false);
+                if(is_object($recipient)) {
+                    $data['artist_id'][$key] = $recipient->id;
+                    $data['artist_url'][$key] = null;
+                }
+            }
+
             // Check that users with the specified id(s) exist on site
-            foreach($data['designer_alias'] as $id) {
+            foreach($data['designer_id'] as $id) {
                 if(isset($id) && $id) {
                     $user = User::find($id);
                     if(!$user) throw new \Exception('One or more designers is invalid.');
                 }
             }
-            foreach($data['artist_alias'] as $id) {
+            foreach($data['artist_id'] as $id) {
                 if(isset($id) && $id) {
                     $user = $user = User::find($id);
                     if(!$user) throw new \Exception('One or more artists is invalid.');
@@ -881,7 +1087,7 @@ class CharacterManager extends Service
             }
 
             // Attach artists/designers
-            foreach($data['designer_alias'] as $key => $id) {
+            foreach($data['designer_id'] as $key => $id) {
                 if($id || $data['designer_url'][$key])
                     DB::table('character_image_creators')->insert([
                         'character_image_id' => $image->id,
@@ -890,7 +1096,7 @@ class CharacterManager extends Service
                         'user_id' => $id
                     ]);
             }
-            foreach($data['artist_alias'] as $key => $id) {
+            foreach($data['artist_id'] as $key => $id) {
                 if($id || $data['artist_url'][$key])
                     DB::table('character_image_creators')->insert([
                         'character_image_id' => $image->id,
@@ -961,7 +1167,7 @@ class CharacterManager extends Service
 
             $isMyo = $image->character->is_myo_slot ? true : false;
             // Save thumbnail
-            if(isset($data['use_cropper'])) $this->cropThumbnail(array_only($data, ['x0','x1','y0','y1']), $image, $isMyo);
+            if(isset($data['use_cropper'])) $this->cropThumbnail(Arr::only($data, ['x0','x1','y0','y1']), $image, $isMyo);
             else $this->handleImage($data['thumbnail'], $image->thumbnailPath, $image->thumbnailFileName);
 
             // Process and save the image itself
@@ -1148,6 +1354,32 @@ class CharacterManager extends Service
     }
 
     /**
+     * Updates a character's genome.
+     *
+     * @param  array                                  $data
+     * @param  \App\Models\Character\CharacterGenome  $genome
+     * @param  \App\Models\User\User                  $user
+     * @return  bool
+     */
+    public function updateCharacterGenome($data, $character, $genome, $user)
+    {
+        DB::beginTransaction();
+        try {
+            if(!$user->hasPower("view_hidden_genetics")) throw new \Exception("You don't have the power to see this.");
+
+            $this->handleCharacterGenome($data, $character, $genome, $user);
+
+            // $character->update();
+            $this->createLog($user->id, null, null, null, $character->id, 'Character Updated', 'Genome edited', 'character', true);
+
+            return $this->commitReturn(true);
+        } catch(\Exception $e) {
+            $this->setError('error', $e->getMessage());
+        }
+        return $this->rollbackReturn(false);
+    }
+
+    /**
      * Updates a character's stats.
      *
      * @param  array                            $data
@@ -1162,7 +1394,7 @@ class CharacterManager extends Service
         try {
             if(!$character->is_myo_slot && Character::where('slug', $data['slug'])->where('id', '!=', $character->id)->exists()) throw new \Exception("Character code must be unique.");
 
-            $characterData = array_only($data, [
+            $characterData = Arr::only($data, [
                 'character_category_id',
                 'number', 'slug',
             ]);
@@ -1370,150 +1602,6 @@ class CharacterManager extends Service
     }
 
     /**
-     * Updates a character's lineage.
-     *
-     * @param  array                            $data
-     * @param  \App\Models\Character\Character  $character
-     * @param  \App\Models\User\User            $user
-     * @param  bool                             $isAdmin
-     * @return  bool
-     */
-    public function updateCharacterLineage($data, $character, $user, $isAdmin = false)
-    {
-        DB::beginTransaction();
-
-        try {
-            if(!$user->hasPower('manage_characters')) throw new \Exception('You do not have the required permissions to do this.');
-            $roots = [
-                'sire',
-                'sire_sire', 'sire_sire_sire', 'sire_sire_dam',
-                'sire_dam',  'sire_dam_sire',  'sire_dam_dam',
-                'dam',
-                'dam_sire',  'dam_sire_sire',  'dam_sire_dam',
-                'dam_dam',   'dam_dam_sire',   'dam_dam_dam'
-            ];
-            // you don't need to look for great-great-grandparents
-            $shortlist = [
-                'sire', 'sire_sire', 'sire_dam',
-                'dam', 'dam_sire', 'dam_dam',
-            ];
-            $line = null;
-            $skipFlag = false;
-
-            // Check if we need to create a lineage bc this character doesn't have one.
-            if(!$character->lineage) {
-                $line = $this->handleCharacterLineage($data, $character, $character->is_myo_slot);
-                // tells us we don't need to calculate ancestors as handleCharacterLineage already does
-                $skipFlag = true;
-            }
-            else {
-                // Grab the character's existing lineage
-                $line = $character->lineage;
-            }
-
-            // If we have a lineage already, and didn't just create one, then update it.
-            if(!$skipFlag){
-                // Checking inputs ?
-                for ($i=0; $i < 14; $i++) {
-                    // if isset Data key_id, set Lineage key_id and check if that character exists?
-                    // else if isset Data key_name, set Lineage key_name to that.
-                    if (isset($data[$roots[$i].'_id'])) {
-                        $id = $data[$roots[$i].'_id'];
-                        $line[$roots[$i].'_id'] = $id;
-                        $char = Character::find($id);
-
-                        // TODO Set name to be the slug of the character.
-                        $line[$roots[$i].'_name'] = $char->slug;
-                    }
-                    else if (isset($data[$roots[$i].'_name'])) {
-                        $line[$roots[$i].'_name'] = $data[$roots[$i].'_name'];
-                    }
-                    else {
-                        // EG. someone deleted it, so we erase it.
-                        $line[$roots[$i].'_id'] = null;
-                        $line[$roots[$i].'_name'] = null;
-                    }
-                }
-            }
-
-            // If generate_ancestors is set and we didn't just create a new lineage ...
-            if (!$skipFlag && isset($data['generate_ancestors'])) {
-                // for each of this character's shortlist of ancestors...
-                for ($j=0; $j < 6; $j++) {
-                    $key = $shortlist[$j];
-                    $id = isset($data[$key.'_id']) ? $data[$key.'_id'] : null;
-
-                    // check if this is a character id and not null
-                    if ($id !== null) {
-                        // check if this exists and has lineage
-                        $char = Character::find($id);
-                        if($char->exists() && $char->lineage !== null) {
-                            // go through their parents and gparents
-                            for ($k=0; $k < 6; $k++) {
-                                // checks that this is a valid lineage index
-                                // eg. sire_sire_sire and not sire_sire_sire_sire
-                                $key2 = $key."_".$shortlist[$k];
-                                if (in_array($key2, $roots, true)) {
-                                    $line[$key2."_id"] = $char->lineage[$shortlist[$k]."_id"];
-                                    $line[$key2."_name"] = $char->lineage[$shortlist[$k]."_name"];
-                                }
-                            }
-                        }
-                        else {
-                            for ($k=0; $k < 6; $k++) {
-                                $key2 = $key."_".$shortlist[$k];
-                                if (in_array($key2, $roots, true)) {
-                                    $line[$key2."_id"] = null;
-                                    $line[$key2."_name"] = null;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // if this request wants to update descendants
-            if (isset($data['update_descendants'])) {
-                // TODO: See if there's a better way to query this, because it is HELL on the database.
-
-                // find the descendants of this character
-                $children = CharacterLineage::query()
-                    ->where  ('sire_id',        $character->id)
-                    ->orWhere('sire_sire_id',   $character->id)
-                    ->orWhere('sire_dam_id',    $character->id)
-                    ->orWhere('dam_id',         $character->id)
-                    ->orWhere('dam_dam_id',     $character->id)
-                    ->orWhere('dam_sire_id',    $character->id)
-                    ->get();
-
-                // go through each descendant
-                foreach ($children as $child) {
-                    // search the lineage to find which ancestor this character is
-                    for ($k=0; $k < 6; $k++) {
-                        if ($child[$shortlist[$k]."_id"] == $character-> id) {
-                            for ($j=0; $j < 6; $j++) {
-                                $key = $shortlist[$k]."_".$shortlist[$j];
-                                if (in_array($key, $roots, true)) {
-                                    $child[$key."_id"] = $line[$shortlist[$j].'_id'];
-                                    $child[$key."_name"] = $line[$shortlist[$j].'_name'];
-                                }
-                            }
-                        }
-                    }
-                // save the changes
-                $child->save();
-                }
-            }
-            // and we're done!
-            if(!$skipFlag) $character->lineage->save();
-            return $this->commitReturn(true);
-        } catch(\Exception $e) {
-            $this->setError('error', $e->getMessage());
-        }
-        return $this->rollbackReturn(false);
-    }
-
-    /**
      * Deletes a character.
      *
      * @param  \App\Models\Character\Character  $character
@@ -1580,9 +1668,19 @@ class CharacterManager extends Service
             if(!$recipient) throw new \Exception("Invalid user selected.");
             if($recipient->is_banned) throw new \Exception("Cannot transfer character to a banned member.");
 
+            // deletes any pending design drafts
+            foreach($character->designUpdate as $update)
+            {
+                if($update->status == 'Draft')
+                {
+                   if(!$this->rejectRequest('Cancelled by '.$user->displayName.' in order to transfer character to another user', $update, $user, true, false)) throw new \Exception('Could not cancel pending request.');
+                }
+            }
+
             $queueOpen = Settings::get('open_transfers_queue');
 
             CharacterTransfer::create([
+                'user_reason' => $data['user_reason'],  # pulls from this characters user_reason collum
                 'character_id' => $character->id,
                 'sender_id' => $user->id,
                 'recipient_id' => $recipient->id,
@@ -1625,9 +1723,9 @@ class CharacterManager extends Service
                 if(!$recipient) throw new \Exception("Invalid user selected.");
                 if($character->user_id == $recipient->id) throw new \Exception("Cannot transfer a character to the same user.");
             }
-            else if(isset($data['recipient_alias']) && $data['recipient_alias']) {
-                // Transferring to a dA user
-                $recipient = $data['recipient_alias'];
+            else if(isset($data['recipient_url']) && $data['recipient_url']) {
+                // Transferring to an off-site user
+                $recipient = checkAlias($data['recipient_url']);
             }
             else throw new \Exception("Please enter a recipient for the transfer.");
 
@@ -1637,6 +1735,14 @@ class CharacterManager extends Service
                 $transfer->status = 'Canceled';
                 $transfer->reason = 'Transfer canceled by '.$user->displayName.' in order to transfer character to another user';
                 $transfer->save();
+            }
+            // deletes any pending design drafts
+            foreach($character->designUpdate as $update)
+            {
+                if($update->status == 'Draft')
+                {
+                   if(!$this->rejectRequest('Cancelled by '.$user->displayName.' in order to transfer character to another user', $update, $user, true, false)) throw new \Exception('Could not cancel pending request.');
+                }
             }
 
             $sender = $character->user;
@@ -1650,8 +1756,8 @@ class CharacterManager extends Service
                     'character_slug' => $character->slug,
                     'sender_name' => $user->name,
                     'sender_url' => $user->url,
-                    'recipient_name' => is_object($recipient) ? $recipient->name : $recipient . '@dA',
-                    'recipient_url' => is_object($recipient) ? $recipient->url : 'http://www.deviantart.com/' . $recipient,
+                    'recipient_name' => is_object($recipient) ? $recipient->name : prettyProfileName($recipient),
+                    'recipient_url' => is_object($recipient) ? $recipient->url : $recipient,
                 ]);
             }
             if(is_object($recipient)) {
@@ -1861,9 +1967,10 @@ class CharacterManager extends Service
     public function moveCharacter($character, $recipient, $data, $cooldown = -1, $logType = null)
     {
         $sender = $character->user;
+        if(!$sender) $sender = $character->owner_url;
 
         // Update character counts if the sender has an account
-        if($sender) {
+        if(is_object($sender)) {
             $sender->settings->save();
         }
 
@@ -1876,10 +1983,10 @@ class CharacterManager extends Service
         $character->sort = 0;
         if(is_object($recipient)) {
             $character->user_id = $recipient->id;
-            $character->owner_alias = null;
+            $character->owner_url = null;
         }
         else {
-            $character->owner_alias = $recipient;
+            $character->owner_url = $recipient;
             $character->user_id = null;
         }
         if ($cooldown < 0) {
@@ -1905,7 +2012,7 @@ class CharacterManager extends Service
             ]);
         }
 
-        if(Config::get('lorekeeper.settings.reset_character_profile_on_transfer')) {
+        if(Config::get('lorekeeper.settings.reset_character_profile_on_transfer') && !$character->is_myo_slot) {
             // Reset name and profile
             $character->update(['name' => null]);
 
@@ -1918,10 +2025,10 @@ class CharacterManager extends Service
 
         // Add a log for the ownership change
         $this->createLog(
-            $sender ? $sender->id : null,
-            $sender ? null : $character->owner_alias,
+is_object($sender) ? $sender->id : null,
+            is_object($sender) ? null : $sender,
             $recipient && is_object($recipient) ? $recipient->id : null,
-            $recipient && is_object($recipient) ? $recipient->alias : ($recipient ? : null),
+            $recipient && is_object($recipient) ? $recipient->url : ($recipient ? : null),
             $character->id, $logType ? $logType : ($character->is_myo_slot ? 'MYO Slot Transferred' : 'Character Transferred'), $data, 'user');
     }
 
@@ -2033,7 +2140,7 @@ class CharacterManager extends Service
             if(!$isAdmin || ($isAdmin && isset($data['modify_thumbnail']))) {
                 $imageData = [];
                 if(isset($data['use_cropper'])) {
-                    $imageData = array_only($data, [
+                    $imageData = Arr::only($data, [
                         'use_cropper',
                         'x0', 'x1', 'y0', 'y1',
                     ]);
@@ -2050,13 +2157,13 @@ class CharacterManager extends Service
             $request->artists()->delete();
 
             // Check that users with the specified id(s) exist on site
-            foreach($data['designer_alias'] as $id) {
+            foreach($data['designer_id'] as $id) {
                 if(isset($id) && $id) {
                     $user = User::find($id);
                     if(!$user) throw new \Exception('One or more designers is invalid.');
                 }
             }
-            foreach($data['artist_alias'] as $id) {
+            foreach($data['artist_id'] as $id) {
                 if(isset($id) && $id) {
                     $user = $user = User::find($id);
                     if(!$user) throw new \Exception('One or more artists is invalid.');
@@ -2064,7 +2171,7 @@ class CharacterManager extends Service
             }
 
             // Attach artists/designers
-            foreach($data['designer_alias'] as $key => $id) {
+            foreach($data['designer_id'] as $key => $id) {
                 if($id || $data['designer_url'][$key])
                     DB::table('character_image_creators')->insert([
                         'character_image_id' => $request->id,
@@ -2074,7 +2181,7 @@ class CharacterManager extends Service
                         'user_id' => $id
                     ]);
             }
-            foreach($data['artist_alias'] as $key => $id) {
+            foreach($data['artist_id'] as $key => $id) {
                 if($id || $data['artist_url'][$key])
                     DB::table('character_image_creators')->insert([
                         'character_image_id' => $request->id,
@@ -2091,7 +2198,7 @@ class CharacterManager extends Service
             // Save thumbnail
             if(!$isAdmin || ($isAdmin && isset($data['modify_thumbnail']))) {
                 if(isset($data['use_cropper']))
-                    $this->cropThumbnail(array_only($data, ['x0','x1','y0','y1']), $request);
+                    $this->cropThumbnail(Arr::only($data, ['x0','x1','y0','y1']), $request);
                 else if(isset($data['thumbnail']))
                     $this->handleImage($data['thumbnail'], $request->imageDirectory, $request->thumbnailFileName);
             }
@@ -2148,13 +2255,14 @@ class CharacterManager extends Service
             // We're also not going to add logs as this might add unnecessary fluff to the logs and the items still belong to the user.
             // Perhaps later I'll add a way to locate items that are being held by updates/trades.
             if(isset($data['stack_id'])) {
-                foreach($data['stack_id'] as $key=>$stackId) {
+                foreach($data['stack_id'] as $stackId) {
                     $stack = UserItem::with('item')->find($stackId);
                     if(!$stack || $stack->user_id != $request->user_id) throw new \Exception("Invalid item selected.");
-                    $stack->update_count += $data['stack_quantity'][$key];
+                    if(!isset($data['stack_quantity'][$stackId])) throw new \Exception("Invalid quantity selected.");
+                    $stack->update_count += $data['stack_quantity'][$stackId];
                     $stack->save();
 
-                    addAsset($userAssets, $stack, $data['stack_quantity'][$key]);
+                    addAsset($userAssets, $stack, $data['stack_quantity'][$stackId]);
                 }
             }
 
@@ -2184,8 +2292,8 @@ class CharacterManager extends Service
 
             $request->has_addons = 1;
             $request->data = json_encode([
-                'user' => array_only(getDataReadyAssets($userAssets), ['user_items','currencies']),
-                'character' => array_only(getDataReadyAssets($characterAssets), ['currencies'])
+                'user' => Arr::only(getDataReadyAssets($userAssets), ['user_items','currencies']),
+                'character' => Arr::only(getDataReadyAssets($characterAssets), ['currencies'])
             ]);
             $request->save();
 
@@ -2440,8 +2548,8 @@ class CharacterManager extends Service
             $request->save();
 
             // Add a log for the character and user
-            $this->createLog($user->id, null, $request->character->user_id, $request->character->user->alias, $request->character->id, $request->update_type == 'MYO' ? 'MYO Design Approved' : 'Character Design Updated', '[#'.$image->id.']', 'character');
-            $this->createLog($user->id, null, $request->character->user_id, $request->character->user->alias, $request->character->id, $request->update_type == 'MYO' ? 'MYO Design Approved' : 'Character Design Updated', '[#'.$image->id.']', 'user');
+            $this->createLog($user->id, null, $request->character->user_id, $request->character->user->url, $request->character->id, $request->update_type == 'MYO' ? 'MYO Design Approved' : 'Character Design Updated', '[#'.$image->id.']', 'character');
+            $this->createLog($user->id, null, $request->character->user_id, $request->character->user->url, $request->character->id, $request->update_type == 'MYO' ? 'MYO Design Approved' : 'Character Design Updated', '[#'.$image->id.']', 'user');
 
             // If this is for a MYO, set user's FTO status and the MYO status of the slot
             // and clear the character's name
@@ -2487,7 +2595,7 @@ class CharacterManager extends Service
      * @param  bool                                         $forceReject
      * @return  bool
      */
-    public function rejectRequest($data, $request, $user, $forceReject = false)
+    public function rejectRequest($data, $request, $user, $forceReject = false, $notification = true)
     {
         DB::beginTransaction();
 
@@ -2534,12 +2642,15 @@ class CharacterManager extends Service
             $request->status = 'Rejected';
             $request->save();
 
-            // Notify the user
-            Notifications::create('DESIGN_REJECTED', $request->user, [
-                'design_url' => $request->url,
-                'character_url' => $request->character->url,
-                'name' => $request->character->fullName
-            ]);
+            if($notification)
+            {
+                // Notify the user
+                Notifications::create('DESIGN_REJECTED', $request->user, [
+                    'design_url' => $request->url,
+                    'character_url' => $request->character->url,
+                    'name' => $request->character->fullName
+                ]);
+            }
 
             return $this->commitReturn(true);
         } catch(\Exception $e) {
